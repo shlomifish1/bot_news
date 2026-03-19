@@ -1,0 +1,9 @@
+telethon
+simhash
+deep-translator
+langdetect
+google-genai
+openai
+feedparser
+beautifulsoup4
+httpx
