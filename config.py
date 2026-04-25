@@ -23,6 +23,20 @@ SESSION_NAME = 'news_aggregator'
 SIMHASH_THRESHOLD = 3   # אגרסיבי יותר (היה 8) – מונע כפילויות שונות במעט
 WINDOW_HOURS = 12
 
+# AI fallback settings. Keep them empty by default so the bot can boot in
+# zero-AI mode without crashing when no provider keys are configured.
+GROQ_API_KEY = ''
+GEMINI_API_KEY = ''
+HF_TOKEN = ''
+FALLBACK_ORDER = []
+MODELS = {}
+
+# Personal alerts bridge to an external Telegram bot is disabled by default.
+# Keep this OFF to fully disconnect bot_news from AI_AGENTS bot integrations.
+ENABLE_PERSONAL_ALERTS = False
+ALERT_BOT_TOKEN = ""
+ALERT_ADMIN_ID = 165270683
+
 # --- רשימת מילים חסומות (Anti-Spam) ---
 BAD_WORDS = [
     "מבצע", "הנחה", "לרכישה", "קוד קופון", "בחסות", 

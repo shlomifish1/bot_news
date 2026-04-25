@@ -158,20 +158,14 @@ _entities = EntityRegistry()
 # כשמופיעות מילות מפתח חשובות בהודעה → שליחה לערוץ חדשות מרוכזות
 # =========================================================
 
-import os
 import requests
-from dotenv import load_dotenv
-
-# Try to load the .env from the ai_agents directory where the real bot token lives
-dotenv_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'ai_agents', '.env')
-load_dotenv(dotenv_path)
 
 ALERT_KEYWORDS = {
     'שיגור', 'יציאות', 'יציאה', 'פוליגון', 'למרכז'
 }
 
 # ID האדמין שמקבל התראה אישית
-ALERT_ADMIN_ID = 165270683
+ALERT_ADMIN_ID = getattr(config, "ALERT_ADMIN_ID", 165270683)
 ALERT_CACHE_TTL_SEC = 7 * 24 * 60 * 60
 ALERT_CONFIDENCE_THRESHOLD = 0.78
 
@@ -189,11 +183,22 @@ ALERT_WEAK_TERMS = {
 }
 
 
+def _personal_alerts_enabled() -> bool:
+    return bool(getattr(config, "ENABLE_PERSONAL_ALERTS", False))
+
+
+def _personal_alert_bot_token() -> str:
+    return str(getattr(config, "ALERT_BOT_TOKEN", "")).strip()
+
+
 async def send_keyword_alert(text: str, source_title: str, source_link: str | None):
     """
     שולח התראה בולטת לערוץ חדשות מרוכזות + הודעה אישית לאדמין דרך הבוט.
     """
     try:
+        if not _personal_alerts_enabled():
+            return
+
         # Debug print
         logger.info(f"[ALERT CHECK] Checking text (length {len(text)}) for keywords...")
         
@@ -220,7 +225,7 @@ async def send_keyword_alert(text: str, source_title: str, source_link: str | No
 
         # שליחה אישית לאדמין דרך הבוט הפעיל (API של טלגרם) - מגיע מיד לפרטי בבוט
         # (לא שולחים את ההתראה לערוץ החדשות — המידע מגיע לשם ממילא)
-        bot_token = os.getenv("TELEGRAM_BOT_TOKEN") or "8532526453:AAHN2Mv8d8qX7dS6bRtqgffELAslr8uUIG0"
+        bot_token = _personal_alert_bot_token()
         if bot_token:
             try:
                 # We don't use Markdown here because raw news text might contain unescaped *, _, [, etc.
@@ -430,6 +435,9 @@ async def send_security_alert(text: str, source_title: str, source_link: str | N
     Sends a Telegram alert only for real missile/rocket/security events.
     """
     try:
+        if not _personal_alerts_enabled():
+            return
+
         logger.info(f"[ALERT CHECK] Checking text (length {len(text)}) for security alert relevance...")
         result = await classify_security_alert(text, source_title)
         if not result.get("is_alert"):
@@ -447,7 +455,7 @@ async def send_security_alert(text: str, source_title: str, source_link: str | N
             f"reason: {result.get('reason', 'n/a')}"
         )
 
-        bot_token = os.getenv("TELEGRAM_BOT_TOKEN") or "8532526453:AAHN2Mv8d8qX7dS6bRtqgffELAslr8uUIG0"
+        bot_token = _personal_alert_bot_token()
         if not bot_token:
             logger.error("[KEYWORD ALERT] NO BOT TOKEN FOUND!")
             return

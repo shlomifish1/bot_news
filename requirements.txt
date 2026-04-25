@@ -2,6 +2,7 @@ telethon
 simhash
 deep-translator
 langdetect
+python-dotenv
 google-genai
 openai
 feedparser

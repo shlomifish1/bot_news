@@ -24,11 +24,15 @@ class AIManager:
         self._init_clients()
 
     def _init_clients(self):
+        groq_key = getattr(config, "GROQ_API_KEY", "") or ""
+        gemini_key = getattr(config, "GEMINI_API_KEY", "") or ""
+        hf_token = getattr(config, "HF_TOKEN", "") or ""
+
         # Initialize Groq client
-        if config.GROQ_API_KEY:
+        if groq_key:
             try:
                 self.clients["groq"] = AsyncOpenAI(
-                    api_key=config.GROQ_API_KEY,
+                    api_key=groq_key,
                     base_url="https://api.groq.com/openai/v1",
                     max_retries=0
                 )
@@ -36,18 +40,18 @@ class AIManager:
                 logger.error(f"Failed to init Groq client: {e}")
 
         # Initialize Gemini client
-        if config.GEMINI_API_KEY:
+        if gemini_key:
             try:
-                self.clients["gemini"] = genai.Client(api_key=config.GEMINI_API_KEY)
+                self.clients["gemini"] = genai.Client(api_key=gemini_key)
             except Exception as e:
                 logger.error(f"Failed to init Gemini client: {e}")
 
         # Initialize Hugging Face client
-        if config.HF_TOKEN:
+        if hf_token:
             try:
                 self.clients["hf"] = AsyncOpenAI(
                     base_url="https://router.huggingface.co/v1/",
-                    api_key=config.HF_TOKEN,
+                    api_key=hf_token,
                     max_retries=0
                 )
             except Exception as e:
@@ -90,8 +94,8 @@ class AIManager:
 
         # 2. Local fallback cascade
         logger.info("ℹ️ Gateway לא זמין — fallback ל-cascade מקומי")
-        for model_key in config.FALLBACK_ORDER:
-            model_info = config.MODELS.get(model_key)
+        for model_key in getattr(config, "FALLBACK_ORDER", []):
+            model_info = getattr(config, "MODELS", {}).get(model_key)
             if not model_info:
                 continue
             
