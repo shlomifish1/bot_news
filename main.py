@@ -8,9 +8,14 @@ Zero AI calls. Zero cost.
 import asyncio
 import hashlib
 import json
+import os
+import sys
 import sqlite3
 import re
 import time
+import atexit
+import signal
+import tempfile
 from collections import defaultdict
 
 from telethon import TelegramClient, events
@@ -31,6 +36,59 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+if sys.platform == "win32":
+    import msvcrt
+else:
+    import fcntl
+
+_LOCK_HANDLE = None
+
+
+def _release_single_instance_lock() -> None:
+    global _LOCK_HANDLE
+    if not _LOCK_HANDLE:
+        return
+    try:
+        if sys.platform == "win32":
+            _LOCK_HANDLE.seek(0)
+            msvcrt.locking(_LOCK_HANDLE.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            fcntl.flock(_LOCK_HANDLE, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        _LOCK_HANDLE.close()
+    except OSError:
+        pass
+    _LOCK_HANDLE = None
+
+
+def acquire_single_instance_lock(lock_name: str = "bot_news_main.lock"):
+    lock_path = os.path.join(tempfile.gettempdir(), lock_name)
+    lock = open(lock_path, "a+", encoding="utf-8")
+    lock.seek(0)
+    lock.write("0")
+    lock.flush()
+    lock.seek(0)
+    try:
+        if sys.platform == "win32":
+            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        logger.error("❌ bot_news כבר רץ — יוצא.")
+        lock.close()
+        sys.exit(1)
+
+    lock.seek(0)
+    lock.truncate()
+    lock.write(str(os.getpid()))
+    lock.flush()
+    global _LOCK_HANDLE
+    _LOCK_HANDLE = lock
+    atexit.register(_release_single_instance_lock)
+    return lock
 
 # =========================================================
 # IN-MEMORY BUFFER
@@ -1106,6 +1164,18 @@ async def main_handler(event):
 # =========================================================
 
 if __name__ == '__main__':
+    acquire_single_instance_lock()
+
+    def _handle_shutdown(signum, frame):
+        logger.info("🛑 Received signal %s — shutting down...", signum)
+        raise KeyboardInterrupt
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, _handle_shutdown)
+        except (ValueError, OSError):
+            pass
+
     logger.info("Bot starting (zero-AI mode)...")
     init_db()
 
