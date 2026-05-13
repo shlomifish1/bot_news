@@ -17,6 +17,14 @@ import atexit
 import signal
 import tempfile
 from collections import defaultdict
+from io import BytesIO
+
+try:
+    from PIL import Image
+    import imagehash
+    _PHASH_AVAILABLE = True
+except ImportError:
+    _PHASH_AVAILABLE = False
 
 from telethon import TelegramClient, events
 from telethon.tl.functions.channels import CreateChannelRequest
@@ -534,39 +542,68 @@ async def send_security_alert(text: str, source_title: str, source_link: str | N
         logger.error(f"[CRITICAL ALERT ERROR] {e}", exc_info=True)
 
 # =========================================================
-# PHOTO DIMENSION SIGNATURE
-# Two copies of the same image from different channels
-# usually share the same pixel dimensions and approximate size.
-# This catches duplicates that bypass Telegram's file-ID check.
+# PERCEPTUAL HASH (pHash) — visual image dedup
+# Catches same image re-compressed, watermarked, or cropped.
+# Hamming distance ≤ PHASH_THRESHOLD → visually identical.
 # =========================================================
 
-def _photo_signature(message) -> str | None:
-    """Returns 'photo_WxH_SIZEkb' or None."""
-    if not message or not message.media:
-        return None
-    media = message.media
-    if not hasattr(media, 'photo'):
-        return None
-    photo = media.photo
+PHASH_THRESHOLD = 12  # out of 64 bits; ≤12 = ~81% similarity
+
+
+async def check_and_store_phash(message) -> bool:
+    """
+    Downloads image, computes pHash, compares against recent hashes.
+    Returns True if image is a visual duplicate.
+    Skips silently if imagehash is not installed or download fails.
+    """
+    if not _PHASH_AVAILABLE:
+        return False
+    if not message or not message.media or not hasattr(message.media, 'photo'):
+        return False
+
+    # Skip images larger than 5MB to avoid blocking on large downloads
+    photo = message.media.photo
     sizes = getattr(photo, 'sizes', [])
-    if not sizes:
-        return None
-    # Use largest size for the signature
-    largest = None
     for s in sizes:
-        w = getattr(s, 'w', 0)
-        h = getattr(s, 'h', 0)
-        if w and h:
-            if largest is None or w * h > getattr(largest, 'w', 0) * getattr(largest, 'h', 0):
-                largest = s
-    if largest is None:
-        return None
-    w = getattr(largest, 'w', 0)
-    h = getattr(largest, 'h', 0)
-    if w and h:
-        # Dimensions only — size_kb removed since same image re-compressed has same dims
-        return f"photo_{w}x{h}"
-    return None
+        if getattr(s, 'size', 0) > 5 * 1024 * 1024:
+            return False
+
+    try:
+        img_bytes = await client.download_media(message, bytes)
+        if not img_bytes:
+            return False
+        img = Image.open(BytesIO(img_bytes)).convert('RGB')
+        phash_val = str(imagehash.phash(img))
+    except Exception as e:
+        logger.debug(f"[PHASH] compute failed: {e}")
+        return False
+
+    cutoff = time.time() - (config.WINDOW_HOURS * 3600)
+    try:
+        with sqlite3.connect(config.DB_FILE) as conn:
+            c = conn.cursor()
+            c.execute("SELECT phash FROM photo_phashes WHERE timestamp > ?", (cutoff,))
+            recent_hashes = [row[0] for row in c.fetchall()]
+
+        h1 = imagehash.hex_to_hash(phash_val)
+        for rh in recent_hashes:
+            try:
+                if h1 - imagehash.hex_to_hash(rh) <= PHASH_THRESHOLD:
+                    logger.info(f"[PHASH] visual duplicate detected (dist≤{PHASH_THRESHOLD})")
+                    return True
+            except Exception:
+                continue
+
+        # Not a duplicate — store
+        with sqlite3.connect(config.DB_FILE) as conn:
+            c = conn.cursor()
+            c.execute("INSERT INTO photo_phashes (phash, timestamp) VALUES (?, ?)",
+                      (phash_val, time.time()))
+            conn.commit()
+    except Exception as e:
+        logger.debug(f"[PHASH] DB error: {e}")
+
+    return False
 
 
 # =========================================================
@@ -586,6 +623,8 @@ def init_db():
                       name TEXT, channel_id INTEGER)''')
         c.execute('''CREATE TABLE IF NOT EXISTS ai_moderation_cache
                      (text_hash TEXT PRIMARY KEY, result TEXT, timestamp REAL)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS photo_phashes
+                     (phash TEXT, timestamp REAL)''')
 
         # Sync categories from config
         logger.info("Syncing categories from config...")
@@ -845,18 +884,17 @@ def run_dedup(text: str, message_obj, source_id: int) -> dict:
         return {'action': 'BLOCK_DUP', 'cleaned_text': text,
                 'reason': 'video_meta_dup'}
 
-    # --- 3. Photo dimension duplicate ---
-    photo_sig = _photo_signature(message_obj)
-    if photo_sig:
+    # --- 3. Photo exact file-ID duplicate ---
+    photo_exact = get_media_signature(message_obj)
+    if photo_exact and photo_exact.startswith('photo_'):
         with sqlite3.connect(config.DB_FILE) as conn:
             c = conn.cursor()
             cutoff = time.time() - (config.WINDOW_HOURS * 3600)
             c.execute("SELECT COUNT(*) FROM messages WHERE media_id=? AND timestamp>?",
-                      (photo_sig, cutoff))
+                      (photo_exact, cutoff))
             if c.fetchone()[0] > 0:
                 return {'action': 'BLOCK_DUP', 'cleaned_text': text,
-                        'reason': 'photo_dim_dup'}
-        # Store signature (will be committed in save_message_record)
+                        'reason': 'photo_exact_dup'}
 
     # --- 4. Simhash against buffer + DB ---
     recent_rows = get_recent_rows(limit=120)
@@ -959,6 +997,12 @@ async def handle_album_event(event):
             return
 
         text = result['cleaned_text']
+
+        # --- pHash: בדיקת כפילות ויזואלית ---
+        if await check_and_store_phash(messages[0]):
+            logger.info("[ALBUM] BLOCKED: photo_phash_dup")
+            return
+
         save_message_record(text, messages[0], source_id)
 
         translation = translate_to_hebrew(text)
@@ -1126,6 +1170,11 @@ async def main_handler(event):
         return
 
     text = result['cleaned_text']
+
+    # --- pHash: בדיקת כפילות ויזואלית ---
+    if await check_and_store_phash(event.message):
+        logger.info("[BLOCK] photo_phash_dup")
+        return
 
     # --- Store to DB ---
     save_message_record(text, event.message, source_id)

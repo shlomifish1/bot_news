@@ -8,3 +8,5 @@ openai
 feedparser
 beautifulsoup4
 httpx
+Pillow
+imagehash
