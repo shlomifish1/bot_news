@@ -2,7 +2,12 @@ import os
 import logging
 import asyncio
 import httpx
-from google import genai
+try:
+    from google import genai as genai
+    _GENAI_AVAILABLE = True
+except ImportError:
+    genai = None
+    _GENAI_AVAILABLE = False
 from openai import AsyncOpenAI
 import config
 
@@ -40,11 +45,13 @@ class AIManager:
                 logger.error(f"Failed to init Groq client: {e}")
 
         # Initialize Gemini client
-        if gemini_key:
+        if gemini_key and _GENAI_AVAILABLE:
             try:
                 self.clients["gemini"] = genai.Client(api_key=gemini_key)
             except Exception as e:
                 logger.error(f"Failed to init Gemini client: {e}")
+        elif gemini_key and not _GENAI_AVAILABLE:
+            logger.warning("google-genai not installed — Gemini disabled. Install with: pip install google-genai")
 
         # Initialize Hugging Face client
         if hf_token:
