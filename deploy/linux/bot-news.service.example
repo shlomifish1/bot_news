@@ -1,0 +1,20 @@
+[Unit]
+Description=Bot News Telegram Aggregator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=botnews
+Group=botnews
+WorkingDirectory=/opt/bot_news
+EnvironmentFile=/etc/bot-news.env
+ExecStart=/opt/bot_news/venv/bin/python /opt/bot_news/main.py
+Restart=always
+RestartSec=10
+TimeoutStopSec=30
+KillSignal=SIGTERM
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

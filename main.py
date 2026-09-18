@@ -18,6 +18,7 @@ import signal
 import tempfile
 from collections import defaultdict
 from io import BytesIO
+from urllib.parse import urlencode, urljoin
 
 try:
     from PIL import Image
@@ -33,6 +34,9 @@ from telethon.tl.types import MessageMediaWebPage, DocumentAttributeVideo
 from simhash import Simhash
 from deep_translator import GoogleTranslator
 from langdetect import detect
+import feedparser
+import httpx
+from bs4 import BeautifulSoup
 
 import config
 from ai_manager import ai_manager
@@ -44,6 +48,11 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+_file_handler = logging.FileHandler("bot_news.log", encoding="utf-8")
+_file_handler.setFormatter(logging.Formatter(
+    '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+))
+logging.getLogger().addHandler(_file_handler)
 
 if sys.platform == "win32":
     import msvcrt
@@ -625,6 +634,12 @@ def init_db():
                      (text_hash TEXT PRIMARY KEY, result TEXT, timestamp REAL)''')
         c.execute('''CREATE TABLE IF NOT EXISTS photo_phashes
                      (phash TEXT, timestamp REAL)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS web_articles
+                     (article_key TEXT PRIMARY KEY, source TEXT, link TEXT,
+                      title TEXT, timestamp REAL)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS sport_team_daily_counts
+                     (day TEXT, team_key TEXT, count INTEGER,
+                      PRIMARY KEY(day, team_key))''')
 
         # Sync categories from config
         logger.info("Syncing categories from config...")
@@ -714,6 +729,23 @@ def save_mapping(source_id, target_id, title):
         c.execute("INSERT OR REPLACE INTO channel_map VALUES (?, ?, ?)",
                   (source_id, target_id, title))
         conn.commit()
+
+
+def log_health_snapshot():
+    with sqlite3.connect(config.DB_FILE) as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM categories WHERE channel_id IS NOT NULL")
+        categories_count = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM channel_map WHERE target_id != -1")
+        mapped_count = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM channel_map WHERE target_id = -1")
+        ignored_count = c.fetchone()[0]
+    logger.info(
+        "Health: %s categories, %s mapped sources, %s ignored sources",
+        categories_count,
+        mapped_count,
+        ignored_count,
+    )
 
 
 # =========================================================
@@ -855,7 +887,7 @@ def save_message_record(text, message_obj, source_id):
 # On PASS, also returns cleaned text.
 # =========================================================
 
-def run_dedup(text: str, message_obj, source_id: int) -> dict:
+def run_dedup(text: str, message_obj, source_id: int, skip_alert_flood: bool = False) -> dict:
     """
     Full dedup pipeline:
       0. BAD_WORDS (inline before calling this)
@@ -868,12 +900,12 @@ def run_dedup(text: str, message_obj, source_id: int) -> dict:
     Returns {'action': ..., 'cleaned_text': ..., 'reason': ...}
     """
     # --- 1. Alert flood ---
-    if text and _alert.check(text):
+    if not skip_alert_flood and text and _alert.check(text):
         return {'action': 'BLOCK_FLOOD', 'cleaned_text': text,
                 'reason': 'alert_flood'}
 
     # Also block media during alert flood (regardless of text)
-    if _alert.is_active and message_obj and message_obj.media:
+    if not skip_alert_flood and _alert.is_active and message_obj and message_obj.media:
         if not isinstance(getattr(message_obj, 'media', None), MessageMediaWebPage):
             return {'action': 'BLOCK_FLOOD', 'cleaned_text': text,
                     'reason': 'alert_flood_media'}
@@ -935,24 +967,571 @@ def run_dedup(text: str, message_obj, source_id: int) -> dict:
 # TRANSLATION
 # =========================================================
 
-def translate_to_hebrew(text):
+TRANSLATION_BAD_MARKERS = (
+    "error 500",
+    "server error",
+    "that's an error",
+    "that’s an error",
+    "there was an error",
+    "please try again later",
+    "that's all we know",
+    "that’s all we know",
+    "<html",
+    "</html>",
+)
+
+
+def _strip_ai_signature(text: str) -> str:
+    text = re.sub(r"\n_🤖 .*?_", "", text or "", flags=re.DOTALL).strip()
+    text = re.sub(r"^```(?:text)?|```$", "", text, flags=re.MULTILINE).strip()
+    return text
+
+
+def _is_valid_hebrew_translation(original: str, translated: str | None) -> bool:
+    if not translated:
+        return False
+
+    cleaned = _strip_ai_signature(translated)
+    low = cleaned.lower()
+    if any(marker in low for marker in TRANSLATION_BAD_MARKERS):
+        return False
+    if cleaned.strip() == (original or "").strip():
+        return False
+
+    hebrew_chars = len(re.findall(r"[\u0590-\u05FF]", cleaned))
+    latin_chars = len(re.findall(r"[A-Za-z]", cleaned))
+    if hebrew_chars < 6:
+        return False
+
+    # English product names are fine, but a "translation" that stayed mostly
+    # English should not be published under the Hebrew translation header.
+    if latin_chars > max(40, hebrew_chars * 2):
+        return False
+
+    if len(cleaned) > max(1200, len(original or "") * 4):
+        return False
+
+    return True
+
+
+def _should_translate_to_hebrew(text: str) -> bool:
     if not text or len(text.strip()) < 3:
-        return None
+        return False
     try:
         lang = detect(text)
         if lang == 'en':
-            return GoogleTranslator(source='auto', target='iw').translate(text)
-        return None
+            return True
     except Exception as e:
-        logger.warning(f"Translation error: {e}")
+        logger.debug(f"Language detection error: {e}")
+
+    latin_chars = len(re.findall(r"[A-Za-z]", text))
+    hebrew_chars = len(re.findall(r"[\u0590-\u05FF]", text))
+    return latin_chars >= 20 and latin_chars > hebrew_chars * 2
+
+
+def _ai_gateway_base_url() -> str:
+    complete_url = os.environ.get("AI_GATEWAY_URL", "http://127.0.0.1:8000/api/ai/complete")
+    return complete_url.rsplit("/api/ai/complete", 1)[0]
+
+
+async def _translate_with_google(text: str) -> str | None:
+    try:
+        translated = await asyncio.to_thread(
+            lambda: GoogleTranslator(source='auto', target='iw').translate(text)
+        )
+        translated = _strip_ai_signature(translated)
+        if _is_valid_hebrew_translation(text, translated):
+            return translated
+        logger.warning("Google translation returned invalid/error text; using AI fallback.")
+    except Exception as e:
+        logger.warning(f"Google translation error: {e}")
+    return None
+
+
+async def _gateway_json(client_http: httpx.AsyncClient, method: str, path: str, payload: dict | None = None) -> dict:
+    url = _ai_gateway_base_url() + path
+    if method == "GET":
+        resp = await client_http.get(url)
+    else:
+        resp = await client_http.post(url, json=payload or {})
+    resp.raise_for_status()
+    return resp.json()
+
+
+async def _reset_ai_gateway_to_first_model(client_http: httpx.AsyncClient, first_model: str) -> None:
+    try:
+        await _gateway_json(client_http, "POST", "/api/ai/switch-model", {"model_key": first_model})
+    except Exception as e:
+        logger.warning("[TRANSLATE AI] failed to reset cascade start: %s", e)
+
+
+async def _translate_with_ai_cascade(text: str) -> str | None:
+    prompt = f"""
+Translate the following Telegram technology news item into clean Hebrew.
+
+Rules:
+- Return only the Hebrew translation.
+- Keep English product/company names as English when natural.
+- Do not add commentary, markdown fences, headers, or explanations.
+- If there is a link, keep it unchanged.
+- Do not output server errors or placeholders.
+
+Text:
+{text}
+""".strip()
+
+    try:
+        async with httpx.AsyncClient(timeout=35.0) as http_client:
+            status = await _gateway_json(http_client, "GET", "/api/ai/status")
+            model_keys = status.get("free_cascade") or []
+            if not model_keys:
+                result = await ai_manager.chat_completion(prompt, temperature=0.1)
+                result = _strip_ai_signature(result or "")
+                return result if _is_valid_hebrew_translation(text, result) else None
+
+            first_model = model_keys[0]
+            for model_key in model_keys:
+                try:
+                    switched = await _gateway_json(
+                        http_client,
+                        "POST",
+                        "/api/ai/switch-model",
+                        {"model_key": model_key},
+                    )
+                    if not switched.get("ok"):
+                        logger.warning("[TRANSLATE AI] switch failed for %s: %s", model_key, switched)
+                        continue
+
+                    data = await _gateway_json(
+                        http_client,
+                        "POST",
+                        "/api/ai/complete",
+                        {
+                            "messages": [{"role": "user", "content": prompt}],
+                            "temperature": 0.1,
+                            "source": f"bot_news_translate:{model_key}",
+                        },
+                    )
+                    result = _strip_ai_signature(data.get("result") or "")
+                    if data.get("success") and _is_valid_hebrew_translation(text, result):
+                        logger.info("[TRANSLATE AI] success with %s", model_key)
+                        await _reset_ai_gateway_to_first_model(http_client, first_model)
+                        return result
+                    logger.warning("[TRANSLATE AI] invalid result from %s", model_key)
+                except Exception as e:
+                    logger.warning("[TRANSLATE AI] %s failed: %s", model_key, e)
+                    continue
+
+            await _reset_ai_gateway_to_first_model(http_client, first_model)
+    except Exception as e:
+        logger.warning(f"AI translation cascade error: {e}")
+
+    return None
+
+
+async def translate_to_hebrew(text):
+    if not _should_translate_to_hebrew(text):
         return None
+
+    google_translation = await _translate_with_google(text)
+    if google_translation:
+        return google_translation
+
+    ai_translation = await _translate_with_ai_cascade(text)
+    if ai_translation:
+        return ai_translation
+
+    logger.warning("Translation unavailable after Google + AI cascade; skipping translation block.")
+    return None
 
 
 # =========================================================
 # TELEGRAM CLIENT
 # =========================================================
 
-client = TelegramClient(config.SESSION_NAME, config.API_ID, config.API_HASH)
+client = TelegramClient(
+    config.SESSION_NAME,
+    config.API_ID,
+    config.API_HASH,
+)
+
+
+async def heartbeat():
+    while True:
+        await asyncio.sleep(60)
+        logger.info("Heartbeat: connected=%s buffer=%s", client.is_connected(), len(_buffer))
+
+
+# =========================================================
+# SPORTS WEB/RSS WATCHLIST
+# Pulls public sports sources and sends only relevant team updates.
+# Favorite teams are unlimited; all other teams are capped per day.
+# =========================================================
+
+_SPORT_WEB_TASK_STARTED = False
+
+
+def _clean_html_text(raw: str | None) -> str:
+    if not raw:
+        return ""
+    text = BeautifulSoup(str(raw), "html.parser").get_text(" ", strip=True)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _article_key(link: str, title: str) -> str:
+    base = (link or title or "").strip().lower()
+    return hashlib.sha256(base.encode("utf-8")).hexdigest()
+
+
+def _synthetic_source_id(source_name: str) -> int:
+    digest = hashlib.sha256(f"web:{source_name}".encode("utf-8")).hexdigest()[:12]
+    return -int(digest, 16)
+
+
+def _today_key() -> str:
+    return time.strftime("%Y-%m-%d", time.localtime())
+
+
+def _web_article_seen(key: str) -> bool:
+    with sqlite3.connect(config.DB_FILE) as conn:
+        c = conn.cursor()
+        c.execute("SELECT 1 FROM web_articles WHERE article_key = ?", (key,))
+        return c.fetchone() is not None
+
+
+def _store_web_article(key: str, source: str, link: str, title: str) -> None:
+    with sqlite3.connect(config.DB_FILE) as conn:
+        c = conn.cursor()
+        cutoff = time.time() - 30 * 24 * 60 * 60
+        c.execute("DELETE FROM web_articles WHERE timestamp < ?", (cutoff,))
+        c.execute(
+            "INSERT OR IGNORE INTO web_articles (article_key, source, link, title, timestamp) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (key, source, link, title, time.time()),
+        )
+        conn.commit()
+
+
+def _daily_count(team_key: str) -> int:
+    with sqlite3.connect(config.DB_FILE) as conn:
+        c = conn.cursor()
+        c.execute(
+            "SELECT count FROM sport_team_daily_counts WHERE day = ? AND team_key = ?",
+            (_today_key(), team_key),
+        )
+        row = c.fetchone()
+        return int(row[0]) if row else 0
+
+
+def _increment_daily_count(team_key: str) -> None:
+    with sqlite3.connect(config.DB_FILE) as conn:
+        c = conn.cursor()
+        c.execute("DELETE FROM sport_team_daily_counts WHERE day != ?", (_today_key(),))
+        c.execute(
+            "INSERT INTO sport_team_daily_counts (day, team_key, count) VALUES (?, ?, 1) "
+            "ON CONFLICT(day, team_key) DO UPDATE SET count = count + 1",
+            (_today_key(), team_key),
+        )
+        conn.commit()
+
+
+def _contains_any(text: str, needles: list[str]) -> bool:
+    low = text.lower()
+    return any(n.lower() in low for n in needles)
+
+
+def _match_favorite_team(text: str, source_tag: str | None) -> tuple[str | None, str | None]:
+    favorites = getattr(config, "SPORT_FAVORITE_TEAMS", {})
+    low = text.lower()
+    for team_key, info in favorites.items():
+        keywords = info.get("keywords", [])
+        required = info.get("required_context", [])
+        blocked = info.get("blocked_context", [])
+
+        direct_source = source_tag == team_key
+        keyword_match = _contains_any(low, keywords)
+        if not direct_source and not keyword_match:
+            continue
+        if required and not direct_source and not _contains_any(low, required):
+            continue
+        if blocked and _contains_any(low, blocked):
+            continue
+        return team_key, info.get("display", team_key)
+    return None, None
+
+
+def _is_probable_article_link(source: dict, link: str) -> bool:
+    low = (link or "").lower()
+    source_name = (source.get("name") or "").lower()
+    if "maccabi tel aviv basketball" in source_name:
+        return "maccabi.co.il/news.asp?id=" in low
+    if "hapoel petah tikva official" in source_name:
+        return "hapoelpt.com/post/" in low
+    if "365scores" in source_name:
+        return "/news/" in low or "/article/" in low
+    return True
+
+
+def _is_noise_article_title(source: dict, title: str) -> bool:
+    low = (title or "").lower()
+    source_name = (source.get("name") or "").lower()
+    common_noise = [
+        "תקנון", "תנאי שימוש", "פרטיות", "יצירת קשר", "דרושים",
+        "חנות", "כרטיסים", "מנוי", "מנויים", "מחירון", "מפה",
+        "שובר", "החזר", "בעלות", "העברת בעלות",
+    ]
+    if any(term in low for term in common_noise):
+        return True
+    if "maccabi tel aviv basketball" in source_name:
+        maccabi_noise = [
+            "בית משפט", "תא ", "ת\"א ", "תביעה", "סופרברנדס",
+            "superbrands", "אלימות וחרם",
+        ]
+        if any(term.lower() in low for term in maccabi_noise):
+            return True
+    return False
+
+
+def _match_other_team(text: str) -> tuple[str, str]:
+    for team_key, keywords in getattr(config, "SPORT_OTHER_TEAM_KEYWORDS", {}).items():
+        if _contains_any(text, keywords):
+            return team_key, team_key
+    return "sport_general", "ספורט כללי"
+
+
+def _passes_sport_limits(text: str, source_tag: str | None) -> tuple[bool, str, bool]:
+    fav_key, fav_name = _match_favorite_team(text, source_tag)
+    if fav_key:
+        return True, fav_name or fav_key, True
+
+    team_key, display = _match_other_team(text)
+    limit = (
+        getattr(config, "SPORT_WEB_GENERAL_DAILY_LIMIT", 3)
+        if team_key == "sport_general"
+        else getattr(config, "SPORT_WEB_OTHER_TEAM_DAILY_LIMIT", 3)
+    )
+    if _daily_count(team_key) >= limit:
+        return False, display, False
+    return True, display, False
+
+
+def _format_web_article(article: dict, team_display: str) -> str:
+    title = article.get("title", "").strip()
+    summary = article.get("summary", "").strip()
+    link = article.get("link", "").strip()
+    source = article.get("source", "").strip()
+
+    lines = [f"**{team_display}**", "", title]
+    if summary and summary != title:
+        lines.extend(["", summary[:350]])
+    if link:
+        lines.extend(["", f"כתבה: {link}"])
+    lines.extend(["", f"מקור: **{source}**"])
+    return "\n".join(lines)
+
+
+async def _fetch_url_text(url: str) -> str | None:
+    headers = {
+        "User-Agent": "bot_news/1.0 (+personal Telegram RSS reader)",
+        "Accept": "text/html,application/rss+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True, headers=headers) as http:
+        resp = await http.get(url)
+        resp.raise_for_status()
+        return resp.text
+
+
+async def _load_365scores_articles(source: dict) -> list[dict]:
+    competitor_id = source.get("competitor_id")
+    if not competitor_id:
+        logger.warning("[SPORT WEB] 365Scores source missing competitor_id: %s", source.get("name"))
+        return []
+
+    params = {
+        "appTypeId": 5,
+        "langId": 2,
+        "timezoneName": "Asia/Jerusalem",
+        "userCountryId": 6,
+        "competitors": competitor_id,
+        "isPreview": "false",
+    }
+    api_url = f"https://webws.365scores.com/web/news/?{urlencode(params)}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) bot_news/1.0",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "he-IL,he;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Origin": "https://www.365scores.com",
+        "Referer": source.get("url", "https://www.365scores.com/"),
+    }
+
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True, headers=headers) as http:
+        resp = await http.get(api_url)
+        resp.raise_for_status()
+        payload = resp.json()
+
+    source_names = {
+        item.get("id"): item.get("name")
+        for item in payload.get("newsSources", [])
+        if item.get("id") is not None
+    }
+    articles = []
+    for item in payload.get("news", [])[:getattr(config, "SPORT_WEB_MAX_ITEMS_PER_SOURCE", 12)]:
+        title = _clean_html_text(item.get("title"))
+        link = (item.get("url") or "").strip()
+        if not title or not link:
+            continue
+        articles.append({
+            "title": title,
+            "summary": "",
+            "link": link,
+            "source": source_names.get(item.get("sourceId")) or source["name"],
+            "source_tag": source.get("source_tag"),
+        })
+    return articles
+
+
+async def _load_rss_articles(source: dict) -> list[dict]:
+    raw = await _fetch_url_text(source["url"])
+    if not raw:
+        return []
+    feed = feedparser.parse(raw)
+    articles = []
+    for entry in feed.entries[:getattr(config, "SPORT_WEB_MAX_ITEMS_PER_SOURCE", 12)]:
+        title = _clean_html_text(entry.get("title"))
+        summary = _clean_html_text(entry.get("summary") or entry.get("description"))
+        link = (entry.get("link") or "").strip()
+        if title and link:
+            articles.append({
+                "title": title,
+                "summary": summary,
+                "link": link,
+                "source": source["name"],
+                "source_tag": source.get("source_tag"),
+            })
+    return articles
+
+
+async def _load_html_articles(source: dict) -> list[dict]:
+    raw = await _fetch_url_text(source["url"])
+    if not raw:
+        return []
+    soup = BeautifulSoup(raw, "html.parser")
+    articles = []
+    seen_links = set()
+    for a in soup.find_all("a", href=True):
+        title = _clean_html_text(a.get_text(" ", strip=True))
+        if len(title) < 12 or len(title) > 180:
+            continue
+        if _is_noise_article_title(source, title):
+            continue
+        link = urljoin(source["url"], a["href"])
+        if not _is_probable_article_link(source, link):
+            continue
+        if link in seen_links:
+            continue
+        seen_links.add(link)
+        articles.append({
+            "title": title,
+            "summary": "",
+            "link": link,
+            "source": source["name"],
+            "source_tag": source.get("source_tag"),
+        })
+        if len(articles) >= getattr(config, "SPORT_WEB_MAX_ITEMS_PER_SOURCE", 12):
+            break
+    return articles
+
+
+async def _process_web_article(article: dict) -> None:
+    if article.get("source_tag"):
+        text_for_filter = " ".join([
+            article.get("title", ""),
+            article.get("summary", ""),
+            article.get("link", ""),
+        ])
+    else:
+        text_for_filter = article.get("title", "")
+    allowed, team_display, is_favorite = _passes_sport_limits(
+        text_for_filter,
+        article.get("source_tag"),
+    )
+    if not allowed:
+        logger.info("[SPORT WEB] capped: %s | %s", team_display, article.get("title"))
+        return
+
+    key = _article_key(article.get("link", ""), article.get("title", ""))
+    if _web_article_seen(key):
+        return
+
+    dedup_text = "\n".join(
+        part for part in [
+            article.get("title", "").strip(),
+            article.get("summary", "").strip(),
+        ]
+        if part
+    )
+    source_id = _synthetic_source_id(article.get("source", "web"))
+    result = run_dedup(dedup_text, None, source_id, skip_alert_flood=True)
+    if result["action"] != "PASS":
+        logger.info("[SPORT WEB] dedup blocked: %s - %s", result["action"], result["reason"])
+        _store_web_article(key, article.get("source", ""), article.get("link", ""), article.get("title", ""))
+        return
+
+    target_id = config.TARGETS.get("sport")
+    if not target_id:
+        logger.warning("[SPORT WEB] missing sport target")
+        return
+
+    final_message = _format_web_article(article, team_display)
+    await client.send_message(target_id, message=final_message, link_preview=True)
+    save_message_record(dedup_text, None, source_id)
+    _store_web_article(key, article.get("source", ""), article.get("link", ""), article.get("title", ""))
+    if not is_favorite:
+        team_key, _ = _match_other_team(text_for_filter)
+        _increment_daily_count(team_key)
+    logger.info("[SPORT WEB] sent: %s | %s", team_display, article.get("title"))
+
+
+async def sport_web_sources_loop():
+    if not getattr(config, "ENABLE_SPORT_WEB_SOURCES", False):
+        return
+    await asyncio.sleep(20)
+    while True:
+        try:
+            sources = []
+            for src in getattr(config, "SPORT_WEB_RSS_SOURCES", []):
+                sources.append(("rss", src))
+            for src in getattr(config, "SPORT_WEB_365SCORES_SOURCES", []):
+                sources.append(("365scores", src))
+            for src in getattr(config, "SPORT_WEB_HTML_SOURCES", []):
+                sources.append(("html", src))
+
+            for source_type, source in sources:
+                try:
+                    if source_type == "rss":
+                        articles = await _load_rss_articles(source)
+                    elif source_type == "365scores":
+                        articles = await _load_365scores_articles(source)
+                    else:
+                        articles = await _load_html_articles(source)
+                    for article in reversed(articles):
+                        await _process_web_article(article)
+                        await asyncio.sleep(1)
+                except Exception as e:
+                    logger.warning("[SPORT WEB] source failed %s: %s", source.get("name"), e)
+        except Exception as e:
+            logger.exception("[SPORT WEB] loop error: %s", e)
+
+        await asyncio.sleep(getattr(config, "SPORT_WEB_POLL_INTERVAL_SEC", 1200))
+
+
+def start_sport_web_sources_once():
+    global _SPORT_WEB_TASK_STARTED
+    if _SPORT_WEB_TASK_STARTED:
+        return
+    _SPORT_WEB_TASK_STARTED = True
+    client.loop.create_task(sport_web_sources_loop())
+    logger.info("[SPORT WEB] source poller started")
 
 # =========================================================
 # ALBUM CACHE
@@ -1005,7 +1584,7 @@ async def handle_album_event(event):
 
         save_message_record(text, messages[0], source_id)
 
-        translation = translate_to_hebrew(text)
+        translation = await translate_to_hebrew(text)
         final_message = text
         if translation:
             final_message += f"\n\n--- תרגום ---\n{translation}"
@@ -1140,72 +1719,77 @@ async def status_command(event):
 
 @client.on(events.NewMessage)
 async def main_handler(event):
-    if event.is_private:
-        return
-
-    # Handle media groups (albums) separately
-    if event.grouped_id:
-        await handle_album_event(event)
-        return
-
-    source_id = event.chat_id
-    text = event.message.message or ""
-
-    # --- BAD_WORDS (fast, no DB) ---
-    text_lower = text.lower()
-    for word in config.BAD_WORDS:
-        if word.lower() in text_lower:
-            logger.info(f"[BAD_WORD] '{word}'")
+    try:
+        if event.is_private:
             return
 
-    # --- Target lookup ---
-    target_id = get_target_channel(source_id)
-    if not target_id or target_id == -1:
-        return
+        # Handle media groups (albums) separately
+        if event.grouped_id:
+            await handle_album_event(event)
+            return
 
-    # --- Full dedup pipeline ---
-    result = run_dedup(text, event.message, source_id)
-    if result['action'] != 'PASS':
-        logger.info(f"[BLOCK] {result['action']} — {result['reason']}")
-        return
+        source_id = event.chat_id
+        text = event.message.message or ""
 
-    text = result['cleaned_text']
+        # --- BAD_WORDS (fast, no DB) ---
+        text_lower = text.lower()
+        for word in config.BAD_WORDS:
+            if word.lower() in text_lower:
+                logger.info(f"[BAD_WORD] '{word}'")
+                return
 
-    # --- pHash: בדיקת כפילות ויזואלית ---
-    if await check_and_store_phash(event.message):
-        logger.info("[BLOCK] photo_phash_dup")
-        return
+        # --- Target lookup ---
+        target_id = get_target_channel(source_id)
+        if not target_id or target_id == -1:
+            logger.info("[SKIP] Unmapped source: %s", source_id)
+            return
+        logger.info("[INCOMING] source=%s target=%s text_len=%s", source_id, target_id, len(text))
 
-    # --- Store to DB ---
-    save_message_record(text, event.message, source_id)
+        # --- Full dedup pipeline ---
+        result = run_dedup(text, event.message, source_id)
+        if result['action'] != 'PASS':
+            logger.info(f"[BLOCK] {result['action']} — {result['reason']}")
+            return
 
-    # --- Format & send ---
-    original_text = text
-    translation = translate_to_hebrew(original_text)
-    final_message = original_text
-    if translation:
-        final_message += f"\n\n--- תרגום ---\n{translation}"
+        text = result['cleaned_text']
 
-    source_title = event.chat.title or str(source_id)
-    source_link = (f"https://t.me/{event.chat.username}"
-                   if event.chat.username else None)
-    footer = (f"\n\nמקור: [{source_title}]({source_link})"
-              if source_link else f"\n\nמקור: **{source_title}**")
-    final_message += footer
+        # --- pHash: בדיקת כפילות ויזואלית ---
+        if await check_and_store_phash(event.message):
+            logger.info("[BLOCK] photo_phash_dup")
+            return
 
-    media = event.message.media
-    if isinstance(media, MessageMediaWebPage):
-        media = None
+        # --- Store to DB ---
+        save_message_record(text, event.message, source_id)
 
-    try:
-        await client.send_message(target_id, message=final_message,
-                                  file=media, link_preview=False)
-        logger.info(f"[SENT] → {target_id}")
+        # --- Format & send ---
+        original_text = text
+        translation = await translate_to_hebrew(original_text)
+        final_message = original_text
+        if translation:
+            final_message += f"\n\n--- תרגום ---\n{translation}"
+
+        source_title = event.chat.title or str(source_id)
+        source_link = (f"https://t.me/{event.chat.username}"
+                       if event.chat.username else None)
+        footer = (f"\n\nמקור: [{source_title}]({source_link})"
+                  if source_link else f"\n\nמקור: **{source_title}**")
+        final_message += footer
+
+        media = event.message.media
+        if isinstance(media, MessageMediaWebPage):
+            media = None
+
+        try:
+            await client.send_message(target_id, message=final_message,
+                                      file=media, link_preview=False)
+            logger.info(f"[SENT] → {target_id}")
+        except Exception as e:
+            logger.warning(f"[SEND ERROR] {e}")
+
+        # --- בדיקת מילות מפתח → התראה לערוץ חדשות מרוכזות ---
+        await send_security_alert(text, source_title, source_link)
     except Exception as e:
-        logger.warning(f"[SEND ERROR] {e}")
-
-    # --- בדיקת מילות מפתח → התראה לערוץ חדשות מרוכזות ---
-    await send_security_alert(text, source_title, source_link)
+        logger.exception("[HANDLER ERROR] Failed to process incoming message: %s", e)
 
 
 # =========================================================
@@ -1227,6 +1811,7 @@ if __name__ == '__main__':
 
     logger.info("Bot starting (zero-AI mode)...")
     init_db()
+    log_health_snapshot()
 
     MAX_RETRIES = 0       # 0 = infinite
     RETRY_DELAY = 10      # seconds between retries (grows exponentially)
@@ -1243,12 +1828,22 @@ if __name__ == '__main__':
                 logger.error("Client failed to connect!")
                 raise ConnectionError("client.start() succeeded but is_connected() is False")
             logger.info("Client connected.")
-            client.loop.run_until_complete(
-                client.send_message(config.ADMIN_USER,
-                                    f"✅ המערכת עלתה (zero-AI mode, aggressive dedup)"
-                                    + (f" | reconnect #{attempt}" if attempt > 1 else ""))
-            )
+            try:
+                client.loop.run_until_complete(asyncio.wait_for(
+                    client.send_message(
+                        config.ADMIN_USER,
+                        f"✅ המערכת עלתה (zero-AI mode, aggressive dedup)"
+                        + (f" | reconnect #{attempt}" if attempt > 1 else "")
+                    ),
+                    timeout=15,
+                ))
+                logger.info("Startup notification sent.")
+            except Exception as e:
+                logger.warning("Startup notification failed/skipped: %s", e)
             attempt = 0  # reset on successful connection
+            logger.info("Listening for Telegram updates...")
+            client.loop.create_task(heartbeat())
+            start_sport_web_sources_once()
             client.run_until_disconnected()
             # run_until_disconnected returned → connection dropped
             logger.warning("Disconnected from Telegram. Will reconnect...")

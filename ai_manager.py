@@ -16,7 +16,10 @@ logger = logging.getLogger("AIManager")
 # ─── AI Gateway URL (ai_agents server running locally) ───────────────────────
 # כשהשרת הראשי פעיל, bot_news יפנה אליו במקום לנהל AI עצמאי.
 # זה מאפשר ניצול FREE_CASCADE המשותף ומעקב עלויות מרכזי.
-AI_GATEWAY_URL = os.environ.get("AI_GATEWAY_URL", "http://127.0.0.1:8000/api/ai/complete")
+AI_GATEWAY_URL = os.environ.get("AI_GATEWAY_URL", "http://127.0.0.1:8000/api/ai/complete").strip()
+AI_GATEWAY_ENABLED = os.environ.get("AI_GATEWAY_ENABLED", "true").strip().lower() in {
+    "1", "true", "yes", "on",
+}
 AI_GATEWAY_TIMEOUT = 12  # שניות
 
 class AIManager:
@@ -69,6 +72,9 @@ class AIManager:
         🔀 מנסה קודם את ה-AI Gateway של ai_agents (http://localhost:8000/api/ai/complete).
         אם השרת הראשי פעיל — כל הבקשות עוברות דרכו וזה מאחד את ה-FREE_CASCADE.
         """
+        if not AI_GATEWAY_ENABLED or not AI_GATEWAY_URL:
+            return None
+
         try:
             async with httpx.AsyncClient(timeout=AI_GATEWAY_TIMEOUT) as client:
                 resp = await client.post(

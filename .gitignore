@@ -16,7 +16,7 @@ venv/
 bot_news.disabled
 bot_news_watchdog.log
 
-.tmp_*/
+.tmp_*
 *.stdout.log
 *.stderr.log
 *.err.log
