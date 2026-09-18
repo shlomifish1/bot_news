@@ -6,6 +6,7 @@ $LogPath = Join-Path $Root "bot_news.log"
 
 $processes = @(Get-CimInstance Win32_Process |
     Where-Object {
+        $_.Name -match '^python(w)?\.exe$' -and
         $_.CommandLine -and
         $_.CommandLine -match [regex]::Escape($Root) -and
         $_.CommandLine -match "main\.py"

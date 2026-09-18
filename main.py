@@ -1882,7 +1882,10 @@ if __name__ == '__main__':
             break
 
         logger.info(f"Retrying in {delay}s...")
-        time.sleep(delay)
+        for _ in range(delay):
+            if shutdown_requested:
+                break
+            time.sleep(1)
 
     # Cleanup
     try:
