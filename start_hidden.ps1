@@ -8,7 +8,8 @@ $OutLog = Join-Path $Root "bot_news.stdout.log"
 $ErrLog = Join-Path $Root "bot_news.stderr.log"
 
 if (Test-Path -LiteralPath $DisabledMarker) {
-    Remove-Item -LiteralPath $DisabledMarker -Force
+    "bot_news is intentionally disabled locally; cloud service is the active owner."
+    exit 0
 }
 
 if (-not (Test-Path -LiteralPath $Main)) {

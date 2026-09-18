@@ -10,6 +10,15 @@ import hashlib
 import json
 import os
 import sys
+
+# Keep the retired Windows instance off, including direct Python launches.
+# enable_autostart.ps1 is the explicit, reversible local reactivation path.
+if os.name == "nt" and os.path.isfile(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_news.disabled")
+):
+    print("bot_news is intentionally disabled locally; cloud service is active.")
+    raise SystemExit(0)
+
 import sqlite3
 import re
 import time
