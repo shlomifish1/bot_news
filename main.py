@@ -1798,10 +1798,24 @@ async def main_handler(event):
 
 if __name__ == '__main__':
     acquire_single_instance_lock()
+    shutdown_requested = False
 
     def _handle_shutdown(signum, frame):
+        global shutdown_requested
+        shutdown_requested = True
         logger.info("🛑 Received signal %s — shutting down...", signum)
-        raise KeyboardInterrupt
+
+        def _schedule_disconnect():
+            try:
+                client.loop.create_task(client.disconnect())
+            except Exception:
+                pass
+
+        try:
+            if client.is_connected() and client.loop.is_running():
+                client.loop.call_soon_threadsafe(_schedule_disconnect)
+        except Exception:
+            pass
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
@@ -1845,13 +1859,23 @@ if __name__ == '__main__':
             client.loop.create_task(heartbeat())
             start_sport_web_sources_once()
             client.run_until_disconnected()
+            if shutdown_requested:
+                logger.info("Shutdown requested; leaving reconnect loop.")
+                break
             # run_until_disconnected returned → connection dropped
             logger.warning("Disconnected from Telegram. Will reconnect...")
         except KeyboardInterrupt:
+            shutdown_requested = True
             logger.info("Shutting down (Ctrl+C)...")
             break
         except Exception as e:
+            if shutdown_requested:
+                logger.info("Shutdown requested; leaving reconnect loop.")
+                break
             logger.error(f"Connection error (attempt #{attempt}): {e}")
+
+        if shutdown_requested:
+            break
 
         if MAX_RETRIES and attempt >= MAX_RETRIES:
             logger.critical(f"Gave up after {attempt} attempts.")
