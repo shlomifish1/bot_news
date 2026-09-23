@@ -41,7 +41,7 @@ from telethon.tl.functions.channels import CreateChannelRequest
 from telethon.tl.functions.messages import ExportChatInviteRequest
 from telethon.tl.types import MessageMediaWebPage, DocumentAttributeVideo
 from simhash import Simhash
-from deep_translator import GoogleTranslator
+from deep_translator import GoogleTranslator, MyMemoryTranslator
 from langdetect import detect
 import feedparser
 import httpx
@@ -1051,9 +1051,63 @@ async def _translate_with_google(text: str) -> str | None:
         translated = _strip_ai_signature(translated)
         if _is_valid_hebrew_translation(text, translated):
             return translated
-        logger.warning("Google translation returned invalid/error text; using AI fallback.")
+        logger.warning("Google translation returned invalid/error text; using fallback.")
     except Exception as e:
         logger.warning(f"Google translation error: {e}")
+    return None
+
+
+def _translation_chunks(text: str, max_chars: int = 450) -> list[str]:
+    """Split long Telegram posts into MyMemory-safe chunks."""
+    chunks = []
+    current = ""
+    for part in re.split(r"(?<=[.!?])\s+|\n+", (text or "").strip()):
+        part = part.strip()
+        if not part:
+            continue
+        while len(part) > max_chars:
+            cut = part.rfind(" ", 0, max_chars + 1)
+            if cut < max_chars // 2:
+                cut = max_chars
+            piece, part = part[:cut].strip(), part[cut:].strip()
+            if current:
+                chunks.append(current)
+                current = ""
+            if piece:
+                chunks.append(piece)
+        candidate = f"{current} {part}".strip() if current else part
+        if len(candidate) <= max_chars:
+            current = candidate
+        else:
+            if current:
+                chunks.append(current)
+            current = part
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+async def _translate_with_mymemory(text: str) -> str | None:
+    try:
+        translated_parts = []
+        for chunk in _translation_chunks(text):
+            translated = await asyncio.to_thread(
+                lambda chunk=chunk: MyMemoryTranslator(
+                    source="en-GB", target="he-IL"
+                ).translate(chunk)
+            )
+            if not translated:
+                return None
+            translated_parts.append(_strip_ai_signature(translated))
+            await asyncio.sleep(0.15)
+
+        translated = "\n".join(translated_parts).strip()
+        if _is_valid_hebrew_translation(text, translated):
+            logger.info("[TRANSLATE] MyMemory fallback succeeded.")
+            return translated
+        logger.warning("MyMemory translation returned invalid text.")
+    except Exception as e:
+        logger.warning(f"MyMemory translation error: {e}")
     return None
 
 
@@ -1075,6 +1129,13 @@ async def _reset_ai_gateway_to_first_model(client_http: httpx.AsyncClient, first
 
 
 async def _translate_with_ai_cascade(text: str) -> str | None:
+    gateway_enabled = os.environ.get("AI_GATEWAY_ENABLED", "true").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+    gateway_base = _ai_gateway_base_url().strip()
+    if not gateway_enabled or not gateway_base.startswith(("http://", "https://")):
+        return None
+
     prompt = f"""
 Translate the following Telegram technology news item into clean Hebrew.
 
@@ -1146,11 +1207,15 @@ async def translate_to_hebrew(text):
     if google_translation:
         return google_translation
 
+    mymemory_translation = await _translate_with_mymemory(text)
+    if mymemory_translation:
+        return mymemory_translation
+
     ai_translation = await _translate_with_ai_cascade(text)
     if ai_translation:
         return ai_translation
 
-    logger.warning("Translation unavailable after Google + AI cascade; skipping translation block.")
+    logger.warning("Translation unavailable after Google + MyMemory + AI cascade; skipping translation block.")
     return None
 
 
